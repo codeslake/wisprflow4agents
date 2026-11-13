@@ -1,0 +1,15 @@
+{
+  "name": "wisprflow4agents",
+  "version": "0.1.0",
+  "description": "Watch Wispr Flow notes from Claude Code through slash commands you type; the model gets no Wispr access.",
+  "author": { "name": "codeslake" },
+  "license": "MIT",
+  "userConfig": {
+    "browser_ssh_host": {
+      "type": "string",
+      "title": "Browser ssh host",
+      "description": "When Claude Code runs on a remote machine: the ssh host(s), comma-separated, of the machine whose browser you sign in with. Login then forwards the callback port there for the login's lifetime. Empty: the browser is on this machine. The WISPRFLOW4AGENTS_BROWSER_SSH environment variable overrides it.",
+      "default": ""
+    }
+  }
+}
