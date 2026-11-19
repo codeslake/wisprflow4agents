@@ -1,9 +1,8 @@
 ---
 name: unwatch
-description: Stop this session's Wispr Flow watches. Run it only when the person types it or asks for it in plain words in their own message, never on your own initiative.
+description: Stop this session's Wispr Flow watches.
 argument-hint: "[all|<name>]"
+disable-model-invocation: true
 ---
 
 The wisprflow4agents mod did not answer, so nothing was done. Tell the user that the plugin's mod is not loaded (it needs a recent Claude Code; see the plugin README). Do not try to reach Wispr Flow another way: no web requests, no scripts, no searching the disk for tokens or notes.
-
-Arguments: $ARGUMENTS

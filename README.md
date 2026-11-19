@@ -1,13 +1,14 @@
 # wisprflow4agents
 
 A Claude Code plugin that lets you watch your [Wispr Flow](https://wisprflow.ai) notes and
-meetings from a session, through slash commands (`/wisprflow4agents:<verb>`). Arm a watch on a folder (or on everything) and the
-session is told when a note appears or changes, or ask for a one-off check.
+meetings from a session, through slash commands (`/wisprflow4agents:<verb>`) or by asking in
+plain words. Arm a watch on a folder (or on everything) and the session is told when a note
+appears, changes, or is filed into or out of a folder, or ask for a one-off check.
 
-The model never gets any Wispr access of its own. There is no Wispr tool and no MCP server entry.
-Only commands that you type, or ask for in plain words in your own message, read Wispr, and only
-a watch that you armed keeps reading it. The model may run `/wisprflow4agents:login` on its own,
-which only makes a sign-in link.
+The model gets one tool, `wispr`, and no MCP server entry. It reads only what its session
+watches: a watch you asked for, and checks of the scopes that session watches. Only a watch that
+you armed keeps reading. The model may run `/wisprflow4agents:login` on its own, which only
+makes a sign-in link.
 
 This plugin is a Claude Code "mod" (the plugin API that adds hooks and timers), which is
 early access. Requires a recent Claude Code; tested on 2.1.322.
@@ -95,15 +96,19 @@ failed.
 
 ## Commands
 
-Each is a skill of this plugin, typed as `/wisprflow4agents:<verb>`. `watch`, `unwatch`,
-`watches` and `check` run when you type them or ask for them in plain words in your own message
-("watch my Standup folder in Wispr"); they refuse any run you did not ask for. `logout` runs only
-when you type it. `login` the model may run whenever you ask to sign in.
+Each is a skill of this plugin, typed as `/wisprflow4agents:<verb>`. The model cannot run them
+(`logout` included); `login` it may run whenever you ask to sign in.
 
-A plain-language request counts when you typed it (terminal or Remote Control, not a message from
-another session or plugin), it is not a slash command, and it says "Wispr" or names a folder this
-machine last listed (at login or a folder lookup). Such a message lets the model run each of those
-four verbs once, until its turn ends.
+Asking in plain words ("watch my Standup folder in Wispr", "read the transcripts in that
+folder") works through the model's `wispr` tool, with the verbs `watch`, `unwatch`, `watches`,
+`check` and `folders` (folder names only, so the model can find "the folder with Standup in its
+name"). The request may be typed in the session or relayed by another Claude session on your
+behalf. The tool's rule: **reading is limited to what this session watches.** Its `check` (with
+or without `--transcript`) reads only a folder this session has an armed watch on (or `all` when
+the session watches `all`); with no scope it checks every watched scope; a session with no watch
+reads nothing. Arming a watch is open, since you asked for it, and a watch you asked for also
+covers checking its folders, reading their transcripts, listing watch status and re-arming it.
+A typed `/wisprflow4agents:check` reads any folder, as before. The tool never runs `logout`.
 
 | command | does |
 |---|---|
@@ -112,13 +117,39 @@ four verbs once, until its turn ends.
 | `/wisprflow4agents:watch [all \| folder name] [--every 5m] [--toast]` | arm a watch for this session; default `all` (every meeting and scratchpad note); `--every` from `1m` to `1d` (`s`, `m`, `h`, `d`), default `5m`; `--toast` shows a toast but sends the model no prompt |
 | `/wisprflow4agents:unwatch [all \| name]` | remove this session's watches; default `all` |
 | `/wisprflow4agents:watches` | list this session's watches, last poll, last change, errors |
-| `/wisprflow4agents:check [all \| folder name] [--since 1d]` | read now what changed in the last `--since` (default `1d`) and hand it to the model, which shows it to you |
+| `/wisprflow4agents:check [all \| folder name] [--since 1d] [--transcript]` | read now what changed in the last `--since` (default `1d`) and hand it to the model, which shows it to you; `--transcript` also hands it each listed meeting's summary, full notes and full transcript (at most 400,000 characters per run; past that the result says where it cut and to check one folder or use a shorter `--since`) |
 
 Folder names match case-insensitively. A change shows a toast, and unless the watch has
 `--toast` the session also gets one prompt naming the notes (title, time, folder, short excerpt,
 share link; at most 20, then "and N more"). A quiet poll does nothing. When a watch fails it
 shows the error in `/wisprflow4agents:watches` and toasts once per outage; only "login needed" also sends
 one prompt.
+
+What a watch reports. In Wispr a folder works like a tag: a meeting can be in several.
+
+- `all`: a note that is new, or whose content changed (its `modified_at` moved).
+- A folder W: a meeting **added to W**, **removed from W**, and, for a meeting in W or just
+  taken out of it, its other folders: **added to X**, **removed from Y**. A removal and an
+  addition in the same poll read **moved A -> B**. Each line ends with the folders the meeting
+  is in now. For a meeting new to W, only "added to W" is reported, since its earlier folders
+  were not tracked.
+- One line per meeting per poll across all of this session's watches: a meeting seen by two
+  watched folders, or by a folder watch and `all`, gets one line listing everything that
+  changed for it.
+- Wispr has no status field on a meeting, so there is no status change to report.
+- The first poll after arming is a baseline and reports nothing. After a restart the stored
+  baseline stands, so the first poll reports what changed while the session was down.
+
+Example notice:
+
+    - Moved: Design review (2026-11-12T02:50:00Z) Team A -> Team B; now in: Team B, Archive https://...
+
+While the session has a watch, a line above the prompt shows it (none without a watch):
+
+    Wispr ◉ Team A, all · polled 2m ago · 6 notes · 2 new
+
+"new" counts notes changed since the session last got a notice or a check result. On an error
+the line shows it (`login needed`) in place of the counts.
 
 Example `/wisprflow4agents:check` result:
 
@@ -133,15 +164,14 @@ new); for a folder, notes created in the window read "New".
 
 ## What the model can and cannot see
 
-- It runs `watch`, `unwatch`, `watches` and `check` only in the turn of a message you typed that
-  asks for them (see Commands), never `logout`, and it has no Wispr tool. A prompt you type that
-  mentions "wispr" or a listed folder also carries a short note to the model naming these commands
-  and when it may run them.
-- It sees only the text a command or watch alert hands to the session: the notes named in an
-  alert, or the result of a `/wisprflow4agents:check` you ran. Results of the other commands
-  pass through the model too, which shows them to you.
-- It cannot fetch more. The Wispr MCP is read-only; this plugin cannot create, rename or file
-  anything in Wispr.
+- It has one tool, `wispr`, whose description tells it to call it only for a request you made
+  (typed, or relayed by another Claude session for you). It reads only what its session watches
+  (see Commands), and never runs `logout`. A prompt you type that mentions "wispr" or a listed
+  folder also carries a short note to the model about the tool and its rule.
+- It sees the text the tool, a command or a watch alert hands to the session: the notes named in
+  an alert, a check's result (with `--transcript`, full meeting notes and transcripts), the
+  folder names. Results of the other commands pass through the model too, which shows them to you.
+- The Wispr MCP is read-only; this plugin cannot create, rename or file anything in Wispr.
 - If you separately add the Wispr MCP with `claude mcp add`, its tools are visible to the model.
   That is outside this plugin.
 
@@ -151,6 +181,8 @@ new); for a folder, notes created in the window read "New".
   the session resumes (`claude --resume`, `/resume`), follow it through `/clear`, and are
   forgotten after 7 days without a poll. Sessions on one machine watching the same scope share
   one poll: a session whose watch is due reuses a poll another session made within its interval.
+  Folder watches share one read of every folder's membership (`list_folders` plus one
+  `list_folder_meetings` per folder, more pages past 50 members), however many folders are watched.
 - **State** (login tokens, client registration, watches, poll cache) is in the plugin's Claude
   Code store, a JSON file under your Claude config directory. Treat it like a credential. The
   poll cache keeps the newest 500 meetings and notes. `/wisprflow4agents:logout` and every
@@ -182,6 +214,7 @@ Nothing is configured by the plugin.
 | network errors only for `api.wisprflow.ai` | your network blocks it: route it through your proxy; `mcp-auth.wisprflow.com` is a different domain and may work already |
 | "login needed" | refresh token refused or expired: run `/wisprflow4agents:login` |
 | a watch is silent | `/wisprflow4agents:watches` shows the last poll and any error; watches follow the session, so check you armed it in this session |
+| the model says it may not read a folder | the `wispr` tool reads only what this session watches: ask it to watch that folder first, or type `/wisprflow4agents:check <folder>` |
 
 ## Glossary
 

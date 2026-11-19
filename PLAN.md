@@ -9,9 +9,10 @@ Facts about the Wispr MCP are in `RESEARCH.md`; this file only decides what to b
    setup, no personal config files, no background daemons. Works installed globally or per project.
 2. After a one-time login per machine, the user can tell a session to **watch** one Wispr
    folder or the whole note list, and the session is told when a note appears or changes.
-3. **The model never reads Wispr on its own.** Installed globally, the plugin must not put
-   Wispr tools in front of the model, and nothing reads notes unless the user asked: a watch
-   the user armed, or a one-off check the user requested.
+3. **The model never reads Wispr on its own.** It gets one tool, `wispr`, and nothing reads
+   notes unless the user asked: a watch the user armed (typed, or asked for in a message the
+   user typed or another Claude session relayed for them), a check of a scope that session
+   watches, or a one-off check the user typed.
 
 Not goals: writing to Wispr (the MCP is read-only: no folders, titles, summaries or filing),
 dictation history (not exposed), anything on Discord.
@@ -26,7 +27,7 @@ plugin-authoring types shipped with Claude Code 2.1.322 (`types/claude-code.d.ts
 | polling | one `wsdaemon.py` per watching session, 120 s | a timer inside the session (`$.clock.every`), re-armed at `session.start` from `$.store` | no process to clean up, survives restart through the store, no extra tooling |
 | waking the session | `notify-session.py` writes NDJSON into the session's private socket | `$.prompt.submit` (T:3111: "a turn of its own, once the session is idle") plus `$.ui.toast` | the socket wire is an undocumented internal; `prompt.submit` is the public mod API (the daemon-based design itself used it for its sign-in alert) |
 | reaching the service | its own scripts | `$.http.fetch` speaking MCP JSON-RPC to `https://api.wisprflow.ai/connect/mcp` | goes through the host, so the user's `HTTPS_PROXY`/`NO_PROXY` apply, if any (to verify) |
-| keeping the model out | write gates only; the main skill was model-invocable | no `mcpServers`, no `.mcp.json`, a model-invocable pointer skill that only names the commands, command skills that answer only a run the person typed or asked for in their own message (login excepted: it only makes a link) | see next section |
+| keeping the model out | write gates only; the main skill was model-invocable | no `mcpServers`, no `.mcp.json`; one mod tool (`wispr`) that reads only what its session watches; command skills that answer only a run the person typed (login excepted: it only makes a link) | see next section |
 | call volume | 5 daemons ≈ 25k API calls/day (measured) | one poll per (machine, account, scope) per interval, shared through `$.store` | that design's own lesson |
 
 The mod API "is early access and moves between releases" (plugin-authoring reference). The
@@ -38,27 +39,31 @@ instead.
 - **No MCP server in the manifest.** T:2873: a listed server joins at session start and its
   tools are visible; only a `tool.check` refusal holds them back, and under
   `allowManagedHooksOnly` a user plugin's hooks do not load while its server still connects
-  (T:2877), so that gate fails open. Not listing it means there are no Wispr tools at all.
+  (T:2877), so that gate fails open. Not listing it means there is no Wispr MCP tool.
 - **The plugin is the only MCP client**, through `$.http.fetch`, and it calls Wispr from
-  exactly two places: a command the user typed, and the poll timer of a watch the user armed.
-- **Commands accept runs the person asked for only.** Each command is a plugin skill answered at
-  `skill.prompt`, which carries no origin. `logout` sets `disable-model-invocation: true` (the
-  Skill tool refuses it, measured), and every hook but login's answers only with a permit left by
-  `prompt.submit` for a typed run of that skill (`e.command`, origin
-  `composer` or `bridge`), which is raised before the skill is rendered (measured).
-  `watch`, `unwatch`, `watches` and `check` also answer a model's Skill call made in the turn of a
-  plain-language prompt from those origins that names Wispr or a folder this machine last listed:
-  that prompt grants one permit per verb, revoked at the main loop's `turn.complete` (10 min
-  backstop). `skill.prompt` has no args field; the model's args arrive in `text` through the
-  SKILL.md's `Arguments: $ARGUMENTS` line (substituted before the hook, measured for typed runs). One permit
-  per skill, the latest typed run's; it lasts 30 s and is revoked when a hook below drops the
-  prompt, so a run that never rendered leaves nothing to reuse (`hooks/permit.ts`). A preload
-  into an agent (an agent file's `skills:`) or another plugin's `$.skill.prompt` call gets a refusal.
+  three places: a command the user typed, the poll timer of an armed watch, and the `wispr`
+  tool under the rule below.
+- **Typed commands.** Each is a plugin skill answered at `skill.prompt`, which carries no origin.
+  `logout`, `watch`, `unwatch`, `watches` and `check` set `disable-model-invocation: true` and
+  answer only with a permit left by `prompt.submit` for a typed run of that skill (`e.command`,
+  origin `composer` or `bridge`), raised before the skill is rendered (measured). One permit per
+  skill, the latest typed run's; it lasts 30 s and is revoked when a hook below drops the
+  prompt (`hooks/permit.ts`). A model-invoked run (a backstop) is refused with a pointer to the tool.
+- **The model's tool.** Model-invoked skills cannot serve the model: a second Skill call of one
+  skill in a session answers "already loaded" and never reaches the mod (measured), and a
+  request relayed by another Claude session carries no typed-origin permit. So the model gets one
+  mod tool, `$.tool.register({ name: 'wispr' })`, schema in the prompt (`isDeferred: false`),
+  answered at `tool.call` for the name the engine returns. Verbs: `watch`, `unwatch`, `watches`,
+  `folders` (names only), `check`; never `logout`. Its description says to call it only for a
+  request the user made, typed or relayed. **Rule:** reading is limited to what the session
+  watches. `check` (with or without `--transcript`) reads only a scope the session has an armed
+  watch on (no scope: each watched scope); a session with no watch reads nothing. Arming is
+  open, since the user asked for it. A typed `check` keeps reading any folder.
 - **`login` is the exception:** model-invocable so "log me in to Wispr" gets the link. It
   only makes a link; it reads no notes.
-- **What reaches the model:** only the text of a watch alert or of a check the user asked
-  for, submitted as a prompt from origin `plugin`. The model can act on that text but has
-  no way to fetch more.
+- **What reaches the model:** the text of a watch alert (a prompt from origin `plugin`), of a
+  check the user typed, and of its `wispr` tool calls. It can fetch more only through the tool,
+  so only what its session watches, plus folder names.
 - If the user separately adds the Wispr MCP with `claude mcp add`, its tools are visible;
   that is outside the plugin and the README says so.
 
@@ -73,7 +78,9 @@ All are plugin skills typed as `/wisprflow4agents:<verb>` (`skills/<verb>/SKILL.
 | `watch [folder name \| all] [--every 5m] [--toast]` | arms a watch for this session. `all` is the whole meeting and note list. |
 | `unwatch [name \| all]` | removes this session's watches. |
 | `watches` | lists this session's watches, last poll, last change, errors. |
-| `check [folder name \| all] [--since 1d]` | one-off read now: what is new or changed, submitted to the model as one prompt. |
+| `check [folder name \| all] [--since 1d] [--transcript]` | one-off read now: what is new or changed, submitted to the model as one prompt; `--transcript` adds each meeting's summary, full notes and full transcript (ranged `get_meeting` reads stitched together, 400,000 characters per run, then a line saying where it cut). |
+
+The `wispr` tool runs the same verbs (and `folders`) from the same code, under the rule above.
 
 ## Watch
 
@@ -83,14 +90,26 @@ All are plugin skills typed as `/wisprflow4agents:<verb>` (`skills/<verb>/SKILL.
   - `all`: `search_meetings` with no query (newest modified first) and
     `search_scratchpad_notes` with no query; page until an item's `modified_at` is older than
     the last poll.
-  - a folder: `list_folder_meetings` (newest first). It returns no `modified_at` and filing
-    does not bump `modified_at` (measured), so the folder watch diffs membership: new ids
-    in the folder are the event.
+  - a folder: every folder's membership in one shared read (`list_folders`, then
+    `list_folder_meetings` per folder), cached under `poll:folders`, so every folder watch on
+    the machine shares it. Filing does not bump `modified_at` (measured), so a folder watch
+    keeps each member's folder set and diffs it: `added to W`, `removed from W`, and for a
+    meeting in W (or just out of it) `added to X` / `removed from Y`; a removal and an addition
+    in one poll read `moved A -> B`. A newcomer's earlier folders are not known to that watch.
+  - Wispr has no status field on a meeting (schema/tools.json), so there is none to watch.
 - Event = a new id, or a known id whose `modified_at` moved (rename, transcript ready,
   speaker rename all moved it; filing into a folder did not).
 - On an event: a toast always; unless `--toast` is given, also one `$.prompt.submit` naming the
-  notes (title, time, folder, a short excerpt, share link). Edge-triggered: nothing on a
-  quiet poll, never a timed prompt.
+  notes (title, time, folder, a short excerpt, share link). Events of one tick from all of a
+  session's watches merge into one line per meeting id (folder changes and a content change
+  together). Edge-triggered: nothing on a quiet poll, never a timed prompt.
+- After a restart the first poll diffs against the baseline kept in the store, so what changed
+  while the session was down is reported. Only arming (or a new login) starts a fresh baseline.
+- A band above the prompt (`ui.render` on `AbovePrompt`) while the session has a watch:
+  `Wispr ◉ <names, three then +N> · polled 2m ago · <notes known> notes · <unread> new`, or the
+  error (`login needed`) in place of the counts. Unread resets when a notice or check result
+  is delivered. Redrawn after each tick and on arm and unarm; it reads only the session's
+  watches, no extra calls.
 - Sharing between sessions: the poll result is cached in `$.store` per (account, scope) with
   its time; a session whose interval is due first checks the cache and only calls Wispr if
   the cached result is older than its interval. N sessions watching `all` cost one poll.
@@ -150,7 +169,7 @@ API is not.
 ## Repository layout
 
     .claude-plugin/plugin.json     name, version, description, license, userConfig
-    hooks/register.tsx             the mod: skill answers, timer, toasts, prompt.submit, login finish
+    hooks/register.tsx             the mod: skill answers, the wispr tool, timer, band, toasts, prompt.submit, login finish
     hooks/login.ts                 loopback listener scripts, callback parsing and redaction (pure)
     hooks/wispr.ts                 MCP JSON-RPC over $.http.fetch, OAuth, token lock
     hooks/watch.ts                 diff logic (pure: old snapshot + new page -> events)
@@ -158,13 +177,13 @@ API is not.
     README.md                      install, login, commands, what the model can and cannot see, troubleshooting
     RESEARCH.md, schema/          kept as is
     docs/research/probe/           research scripts (moved from probe/)
-    skills/wisprflow4agents/       the model-facing pointer skill (explains commands only)
+    skills/wisprflow4agents/       the model-facing pointer skill (the wispr tool and its rule)
     skills/<verb>/                 login, logout, watch, unwatch, watches, check (bodies are fallbacks)
 
 ## Steps, each with its check
 
 1. Scaffold the mod and the manifest; `/wisprflow4agents:watches` prints "no watches".
-   Check: the command runs in a fresh session; the model's tool list has no Wispr tool.
+   Check: the command runs in a fresh session; the model's tool list has no Wispr MCP tool.
 2. `wispr.ts`: MCP over `$.http.fetch`, login (paste flow), refresh with the lock.
    Check: login on a host behind a proxy and on one without; a forced expiry
    refreshes; two sessions refreshing at once both end with a working token.
@@ -180,11 +199,12 @@ API is not.
 
 ## Design decisions
 
-1. **Slash commands only.** The model gets no Wispr tool. A plain-language request such as
-   "check my notes" gets a pointer to `/wisprflow4agents:check`; the model cannot read Wispr itself.
+1. **Slash commands for the person, one tool for the model.** The model reaches Wispr only
+   through `wispr`, and reads only what its session watches. It never tells the user to type a
+   command for something they already asked for.
 2. **Mod-only**: everything through the mod API, state in `$.store`. A file
    only when unavoidable (a log, a lock), and then only under `~/.wisprflow4agents/`, capped. One exception: the login
    listener process, which never outlives its login and never runs twice.
-3. **No pane or band** for now. Commands only.
+3. **No pane.** One band above the prompt, only in a session with a watch.
 4. **Commands are `/wisprflow4agents:<verb>`**, and a plain-language request
    to sign in yields the link.

@@ -1,7 +1,7 @@
 {
   "name": "wisprflow4agents",
   "version": "0.1.0",
-  "description": "Watch Wispr Flow notes from Claude Code through slash commands you type; the model gets no Wispr access.",
+  "description": "Watch Wispr Flow notes and folders from Claude Code; the model reads only what its session watches.",
   "author": { "name": "codeslake" },
   "license": "MIT",
   "userConfig": {
