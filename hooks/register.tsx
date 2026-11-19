@@ -15,6 +15,9 @@ import type { FetchPage, Snapshot, WatchEvent } from './watch.ts'
 // - `skill.prompt` names a skill `wisprflow4agents:<verb>` and carries no origin. A typed skill
 //   raises `prompt.submit` (origin, and `command: { name, args }`) before its `skill.prompt`, so
 //   that hook grants a short-lived permit (permit.ts); every verb but login answers only with one.
+// - A plain-language prompt the person typed that names Wispr or a folder this machine last listed
+//   grants the model a permit for watch, unwatch, watches and check until that turn completes. The
+//   model's args reach `skill.prompt` only in `text`, through the SKILL.md's `$ARGUMENTS` line.
 // - A prompt from a timer may submit directly.
 // - Timers die with a reload or a new process (session.start re-arms) and survive /clear and
 //   in-session resume under a new session id (each tick moves the watches to the current key).
@@ -48,16 +51,21 @@ const UNITS: Record<string, number> = { s: 1000, m: MINUTE, h: 60 * MINUTE, d: D
 const ALLOWED = ['composer', 'bridge'] // typed at the terminal, or Remote Control
 const NS = 'wisprflow4agents:'
 const TYPED_ONLY = ['logout', 'watch', 'unwatch', 'watches', 'check'].map((v) => NS + v)
+const ASKABLE = TYPED_ONLY.filter((v) => v !== NS + 'logout') // the model may run these when the person asked in plain words
 const LOGIN_MS = 15 * MINUTE // how long a sign-in link and its listener live (Wispr's own 5 min start at the click)
 const FORWARD_MS = 15_000 // one ssh forward's try, past ConnectTimeout=10 and a slow jump host
 const ROUTE_WAIT_MS = 7000 // the login hook waits this long for the forward: hooks have a 10 s budget
 const PERMIT_MS = 30_000 // a typed run's skill.prompt follows its prompt.submit within ~0.1 s
+const ASKED_MS = 10 * MINUTE // backstop only: an asked permit is revoked when its turn completes
 const HINT =
-  'Wispr Flow (the user\'s meetings, notes and transcripts) is reachable only through slash commands the user types; ' +
-  'you cannot run them or read Wispr yourself. Name the one that fits: /wisprflow4agents:check [all|<folder>] [--since 1d] ' +
-  '(reads what is new or changed and hands it to you), /wisprflow4agents:watch [all|<folder>] [--every 5m] [--toast], ' +
-  '/wisprflow4agents:unwatch [all|<name>], /wisprflow4agents:watches, /wisprflow4agents:logout. ' +
-  'The one exception: /wisprflow4agents:login only makes a sign-in link, and you may run it when the user asks to sign in to Wispr.'
+  'Wispr Flow (the user\'s meetings, notes and transcripts) is reachable only through the wisprflow4agents skills; ' +
+  'you cannot read Wispr another way. If this message of the user asks in plain words to check, watch, stop watching ' +
+  'or list watches of Wispr notes, invoke the matching skill once with the Skill tool, with the folder name (or all) as args: ' +
+  'wisprflow4agents:check [all|<folder>] [--since 1d] (reads what is new or changed and hands it to you), ' +
+  'wisprflow4agents:watch [all|<folder>] [--every 5m] [--toast], wisprflow4agents:unwatch [all|<name>], wisprflow4agents:watches. ' +
+  'Never invoke them unless the user asked in this message; otherwise name the slash command for them to type. ' +
+  '/wisprflow4agents:logout runs only when the user types it. /wisprflow4agents:login only makes a sign-in link, ' +
+  'and you may run it when the user asks to sign in to Wispr.'
 
 const dur = (s: string) => {
   const m = /^(\d+)([smhd])$/.exec(s)
@@ -99,6 +107,7 @@ export const register: Register = (on, options) => {
   let busy = false
   let wc: ReturnType<typeof wispr> | undefined
   const typedRuns = permits(Date.now, PERMIT_MS)
+  const askedRuns = permits(Date.now, ASKED_MS) // plain-language requests, for the rest of their turn
   let serving = false // this session's login loop runs
   let tried: string | undefined // the pending login's state this session last spawned a listener for
   let child: { return(v?: unknown): Promise<unknown> } | undefined // its listener, while one runs
@@ -131,6 +140,7 @@ export const register: Register = (on, options) => {
   async function resolve(name: string): Promise<{ scope: string; name: string }> {
     if (name.toLowerCase() === 'all') return { scope: 'all', name: 'all' }
     const folders: { id: string; name: string }[] = (await client().call('list_folders'))?.folders ?? []
+    await io.store.set('folders', folders.map((x) => x.name)) // names a plain-language request may use
     const f = folders.find((x) => x.name.toLowerCase() === name.toLowerCase())
     if (!f) throw new Error(`no folder named "${name}". Folders: ${folders.map((x) => x.name).join(', ') || '(none)'}`)
     return { scope: f.id, name: f.name }
@@ -271,6 +281,7 @@ export const register: Register = (on, options) => {
         void child?.return(undefined)
         await forget(io.store) // the account may have changed: no cached note survives a login
         const folders: { name: string }[] = (await client().call('list_folders'))?.folders ?? []
+        await io.store.set('folders', folders.map((f) => f.name))
         return `Signed in to Wispr Flow. Folders: ${folders.map((f) => f.name).join(', ') || '(none)'}.`
       } catch (err) {
         return `Wispr login failed: ${msg(err)}`
@@ -355,7 +366,10 @@ export const register: Register = (on, options) => {
           const url = callbackFromOutput(out)
           if (url) {
             void s.return(undefined)
-            io.toast(await finish(url))
+            const said = await finish(url)
+            io.toast(said)
+            // a background session's model never sees a toast: give it a turn to tell the person
+            void io.submit(`Notice from the wisprflow4agents plugin (not typed by the user): the Wispr Flow sign-in you started finished. Tell the user the result: ${said}`).catch(() => {})
             break
           }
         }
@@ -399,8 +413,9 @@ export const register: Register = (on, options) => {
   }
 
   // A typed /wisprflow4agents:<verb> leaves its args for the skill.prompt that follows. A pasted
-  // callback URL finishes the login, its code redacted from what the model reads. A prompt naming
-  // Wispr gets the command list (the pointer skill alone does not trigger reliably).
+  // callback URL finishes the login, its code redacted from what the model reads. A typed prompt
+  // naming Wispr or a listed folder gets the command list (the pointer skill alone does not
+  // trigger reliably) and lets the model run the askable verbs for this turn.
   on('prompt.submit', async ($, e, next) => {
     if (!ALLOWED.includes(e.origin.kind)) return next(e)
     const url = findCallback(e.text)
@@ -417,14 +432,35 @@ export const register: Register = (on, options) => {
       if ('drop' in r) typedRuns.revoke(skill) // dropped below: no skill.prompt follows
       return r
     }
-    return !e.command && /wispr/i.test(e.text) ? next({ ...e, context: [...(e.context ?? []), HINT] }) : next(e)
+    if (e.command || !(await asked(e.text))) return next(e)
+    for (const v of ASKABLE) askedRuns.grant(v, '')
+    const r = await next({ ...e, context: [...(e.context ?? []), HINT] })
+    if ('drop' in r) for (const v of ASKABLE) askedRuns.revoke(v)
+    return r
   }).catch(($, e, next) => next(e.command ? e : { ...e, text: redactCallback(e.text) })) // a failed hook never blocks the prompt
 
-  const typed = (skill: string) => typedRuns.take(skill)
-  const refuse = (skill: string) => ({
-    text: `Refused: only the person runs /${skill}, by typing it. Do not retry it or reach Wispr Flow another way; tell the user to type /${skill} themselves.`,
+  async function asked(text: string) {
+    if (/wispr/i.test(text)) return true
+    const low = text.toLowerCase()
+    return (((await io.store.get('folders')) ?? []) as string[]).some((n) => n && low.includes(n.toLowerCase()))
+  }
+
+  on('turn.complete', ($, e, next) => {
+    if (e.agentId === undefined) for (const v of ASKABLE) askedRuns.revoke(v)
+    return next(e)
   })
-  const relay = (skill: string, said: string) => ({ text: `Result of /${skill}, typed by the user. Show it to the user as written:\n\n${said}` })
+
+  // The args of a run the person typed or asked for in this turn's message, else undefined. A typed
+  // run's come from its command line; an asked run's from the model, in the SKILL.md's `$ARGUMENTS` line.
+  const typed = (skill: string, text: string) => {
+    const t = typedRuns.take(skill)
+    if (t !== undefined || askedRuns.take(skill) === undefined) return t
+    return /^Arguments: (.*)$/m.exec(text)?.[1].trim() ?? '' // left unsubstituted, it names no folder and fails visibly
+  }
+  const refuse = (skill: string) => ({
+    text: `Refused: /${skill} runs only when the person types it or asks for it in plain words in their own message. Do not retry it or reach Wispr Flow another way; tell the user to ask for it or type /${skill} themselves.`,
+  })
+  const relay = (skill: string, said: string) => ({ text: `Result of /${skill}, run for the user. Show it to the user as written:\n\n${said}` })
 
   on('skill.prompt', { skill: 'wisprflow4agents:login' }, async ($, e) => {
     try {
@@ -448,14 +484,14 @@ export const register: Register = (on, options) => {
   })
 
   on('skill.prompt', { skill: 'wisprflow4agents:logout' }, async ($, e) => {
-    if (typed(e.skill) === undefined) return refuse(e.skill)
+    if (typed(e.skill, e.text) === undefined) return refuse(e.skill)
     await client().logout()
     await forget(io.store)
     return relay(e.skill, "Signed out: this machine's Wispr Flow tokens, client registration and cached notes are deleted. Watches stay armed and report \"login needed\".")
   })
 
   on('skill.prompt', { skill: 'wisprflow4agents:watch' }, async ($, e) => {
-    const args = typed(e.skill)
+    const args = typed(e.skill, e.text)
     if (args === undefined) return refuse(e.skill)
     try {
       const { name, flags } = parse(args, ['every'], ['toast'])
@@ -479,7 +515,7 @@ export const register: Register = (on, options) => {
   })
 
   on('skill.prompt', { skill: 'wisprflow4agents:unwatch' }, async ($, e) => {
-    const args = typed(e.skill)
+    const args = typed(e.skill, e.text)
     if (args === undefined) return refuse(e.skill)
     const name = args.trim().toLowerCase() || 'all'
     const key = await ensure()
@@ -491,7 +527,7 @@ export const register: Register = (on, options) => {
   })
 
   on('skill.prompt', { skill: 'wisprflow4agents:watches' }, async ($, e) => {
-    if (typed(e.skill) === undefined) return refuse(e.skill)
+    if (typed(e.skill, e.text) === undefined) return refuse(e.skill)
     const list: Watch[] = (await io.store.get(await ensure())) ?? []
     if (!list.length) return relay(e.skill, 'No watches in this session.')
     const now = Date.now()
@@ -508,7 +544,7 @@ export const register: Register = (on, options) => {
   })
 
   on('skill.prompt', { skill: 'wisprflow4agents:check' }, async ($, e) => {
-    const args = typed(e.skill)
+    const args = typed(e.skill, e.text)
     if (args === undefined) return refuse(e.skill)
     try {
       const { name, flags } = parse(args, ['since'], [])

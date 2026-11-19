@@ -26,7 +26,7 @@ plugin-authoring types shipped with Claude Code 2.1.322 (`types/claude-code.d.ts
 | polling | one `wsdaemon.py` per watching session, 120 s | a timer inside the session (`$.clock.every`), re-armed at `session.start` from `$.store` | no process to clean up, survives restart through the store, no extra tooling |
 | waking the session | `notify-session.py` writes NDJSON into the session's private socket | `$.prompt.submit` (T:3111: "a turn of its own, once the session is idle") plus `$.ui.toast` | the socket wire is an undocumented internal; `prompt.submit` is the public mod API (the daemon-based design itself used it for its sign-in alert) |
 | reaching the service | its own scripts | `$.http.fetch` speaking MCP JSON-RPC to `https://api.wisprflow.ai/connect/mcp` | goes through the host, so the user's `HTTPS_PROXY`/`NO_PROXY` apply, if any (to verify) |
-| keeping the model out | write gates only; the main skill was model-invocable | no `mcpServers`, no `.mcp.json`, a model-invocable pointer skill that only names the commands, command skills the model cannot invoke and that answer only a typed run (login excepted: it only makes a link) | see next section |
+| keeping the model out | write gates only; the main skill was model-invocable | no `mcpServers`, no `.mcp.json`, a model-invocable pointer skill that only names the commands, command skills that answer only a run the person typed or asked for in their own message (login excepted: it only makes a link) | see next section |
 | call volume | 5 daemons ≈ 25k API calls/day (measured) | one poll per (machine, account, scope) per interval, shared through `$.store` | that design's own lesson |
 
 The mod API "is early access and moves between releases" (plugin-authoring reference). The
@@ -41,11 +41,16 @@ instead.
   (T:2877), so that gate fails open. Not listing it means there are no Wispr tools at all.
 - **The plugin is the only MCP client**, through `$.http.fetch`, and it calls Wispr from
   exactly two places: a command the user typed, and the poll timer of a watch the user armed.
-- **Commands accept typed runs only.** Each command is a plugin skill answered at
-  `skill.prompt`, which carries no origin. Every skill but `login` sets
-  `disable-model-invocation: true` (the Skill tool refuses it, measured), and its hook answers
-  only with a permit left by `prompt.submit` for a typed run of that skill (`e.command`, origin
-  `composer` or `bridge`), which is raised before the skill is rendered (measured). One permit
+- **Commands accept runs the person asked for only.** Each command is a plugin skill answered at
+  `skill.prompt`, which carries no origin. `logout` sets `disable-model-invocation: true` (the
+  Skill tool refuses it, measured), and every hook but login's answers only with a permit left by
+  `prompt.submit` for a typed run of that skill (`e.command`, origin
+  `composer` or `bridge`), which is raised before the skill is rendered (measured).
+  `watch`, `unwatch`, `watches` and `check` also answer a model's Skill call made in the turn of a
+  plain-language prompt from those origins that names Wispr or a folder this machine last listed:
+  that prompt grants one permit per verb, revoked at the main loop's `turn.complete` (10 min
+  backstop). `skill.prompt` has no args field; the model's args arrive in `text` through the
+  SKILL.md's `Arguments: $ARGUMENTS` line (substituted before the hook, measured for typed runs). One permit
   per skill, the latest typed run's; it lasts 30 s and is revoked when a hook below drops the
   prompt, so a run that never rendered leaves nothing to reuse (`hooks/permit.ts`). A preload
   into an agent (an agent file's `skills:`) or another plugin's `$.skill.prompt` call gets a refusal.

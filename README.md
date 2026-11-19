@@ -4,9 +4,10 @@ A Claude Code plugin that lets you watch your [Wispr Flow](https://wisprflow.ai)
 meetings from a session, through slash commands (`/wisprflow4agents:<verb>`). Arm a watch on a folder (or on everything) and the
 session is told when a note appears or changes, or ask for a one-off check.
 
-The model never gets any Wispr access. There is no Wispr tool and no MCP server entry. Only
-commands that you type read Wispr, and only a watch that you armed keeps reading it. The one
-command the model may run is `/wisprflow4agents:login`, which only makes a sign-in link.
+The model never gets any Wispr access of its own. There is no Wispr tool and no MCP server entry.
+Only commands that you type, or ask for in plain words in your own message, read Wispr, and only
+a watch that you armed keeps reading it. The model may run `/wisprflow4agents:login` on its own,
+which only makes a sign-in link.
 
 This plugin is a Claude Code "mod" (the plugin API that adds hooks and timers), which is
 early access. Requires a recent Claude Code; tested on 2.1.322.
@@ -43,8 +44,9 @@ Once per machine:
 
 1. Type `/wisprflow4agents:login`, or ask in plain words ("log me in to Wispr"). You get a link.
 2. Open the link and sign in to Wispr.
-3. Browser on the same machine: the page says "Signed in to Wispr Flow" and the session shows a
-   notice with your folder names. Done.
+3. Browser on the same machine: the page says "Signed in to Wispr Flow", and the session that ran
+   login shows a notice and gets a prompt from the plugin with the result (your folder names, or
+   why it failed), so the model tells you even in a background session. Done.
 4. Browser on another device (ssh, Remote Control from a phone), or no `python3`/`node`: the
    browser lands on a `http://localhost:33418/callback?...` page that fails to load. Copy the
    whole address from the address bar and paste it into the session as a message. The session
@@ -93,8 +95,15 @@ failed.
 
 ## Commands
 
-Each is a skill of this plugin, typed as `/wisprflow4agents:<verb>`. All but `login` run only
-when you type them: the model cannot invoke them, and they refuse any run you did not type.
+Each is a skill of this plugin, typed as `/wisprflow4agents:<verb>`. `watch`, `unwatch`,
+`watches` and `check` run when you type them or ask for them in plain words in your own message
+("watch my Standup folder in Wispr"); they refuse any run you did not ask for. `logout` runs only
+when you type it. `login` the model may run whenever you ask to sign in.
+
+A plain-language request counts when you typed it (terminal or Remote Control, not a message from
+another session or plugin), it is not a slash command, and it says "Wispr" or names a folder this
+machine last listed (at login or a folder lookup). Such a message lets the model run each of those
+four verbs once, until its turn ends.
 
 | command | does |
 |---|---|
@@ -124,9 +133,10 @@ new); for a folder, notes created in the window read "New".
 
 ## What the model can and cannot see
 
-- It cannot run these commands except `login`, and it has no Wispr tool. If you ask "any new
-  Wispr notes?", the bundled skill makes it tell you to type `/wisprflow4agents:check`. A prompt
-  you type that mentions "wispr" also carries a one-line note to the model naming these commands.
+- It runs `watch`, `unwatch`, `watches` and `check` only in the turn of a message you typed that
+  asks for them (see Commands), never `logout`, and it has no Wispr tool. A prompt you type that
+  mentions "wispr" or a listed folder also carries a short note to the model naming these commands
+  and when it may run them.
 - It sees only the text a command or watch alert hands to the session: the notes named in an
   alert, or the result of a `/wisprflow4agents:check` you ran. Results of the other commands
   pass through the model too, which shows them to you.
