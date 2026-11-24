@@ -101,14 +101,15 @@ Each is a skill of this plugin, typed as `/wisprflow4agents:<verb>`. The model c
 
 Asking in plain words ("watch my Standup folder in Wispr", "read the transcripts in that
 folder") works through the model's `wispr` tool, with the verbs `watch`, `unwatch`, `watches`,
-`check` and `folders` (folder names only, so the model can find "the folder with Standup in its
+`check`, `recording` and `folders` (folder names only, so the model can find "the folder with Standup in its
 name"). The request may be typed in the session or relayed by another Claude session on your
 behalf. The tool's rule: **reading is limited to what this session watches.** Its `check` (with
 or without `--transcript`) reads only a folder this session has an armed watch on (or `all` when
 the session watches `all`); with no scope it checks every watched scope; a session with no watch
 reads nothing. Arming a watch is open, since you asked for it, and a watch you asked for also
 covers checking its folders, reading their transcripts, listing watch status and re-arming it.
-A typed `/wisprflow4agents:check` reads any folder, as before. The tool never runs `logout`.
+A typed `/wisprflow4agents:check` reads any folder, as before. The tool's `recording` finds only a meeting in a
+scope the session watches; a typed `/wisprflow4agents:recording` finds any recent meeting. The tool never runs `logout`.
 
 | command | does |
 |---|---|
@@ -118,6 +119,7 @@ A typed `/wisprflow4agents:check` reads any folder, as before. The tool never ru
 | `/wisprflow4agents:unwatch [all \| name]` | remove this session's watches; default `all` |
 | `/wisprflow4agents:watches` | list this session's watches, last poll, last change, errors |
 | `/wisprflow4agents:check [all \| folder name] [--since 1d] [--transcript]` | read now what changed in the last `--since` (default `1d`) and hand it to the model, which shows it to you; `--transcript` also hands it each listed meeting's summary, full notes and full transcript (at most 400,000 characters per run; past that the result says where it cut and to check one folder or use a shorter `--since`) |
+| `/wisprflow4agents:recording <meeting title or id> [--copy <dir>]` | find the meeting's audio (see Recordings) and copy it into the Downloads folder of the machine that has it; `--copy` copies it into `<dir>` on the Claude Code machine instead (a relative `<dir>` is under the session's project) |
 
 Folder names match case-insensitively. A change shows a toast, and unless the watch has
 `--toast` the session also gets one prompt naming the notes (title, time, folder, short excerpt,
@@ -166,6 +168,22 @@ Example `/wisprflow4agents:check` result:
 For `all`, every note modified in the window reads "Changed" (the listing does not say which are
 new); for a folder, notes created in the window read "New".
 
+## Recordings
+
+Wispr's cloud API has no audio. The Wispr Flow desktop app keeps each meeting's audio only on the
+machine that recorded it, as `upload.ogg` (or a raw `mic.pcm`) in
+`~/Library/Application Support/Wispr Flow/meetings/<meeting id>/` on macOS (on Windows
+`%APPDATA%\Wispr Flow\meetings\<meeting id>\` is a guess, not measured). `recording` matches the
+meeting by title (case-insensitive; the newest when several share it, and it says so) or id, then
+looks on this machine and on each `browser_ssh_host` (see Login from a remote machine) with
+`ssh -o BatchMode=yes -o ConnectTimeout=10 <host> 'sh -c ...'`. It answers where the file is, its
+size, modified time and, when `ffprobe` or `afinfo` there can tell, its duration, and copies it as
+`<title>-<YYYY-MM-DD>.ogg` (the meeting's date as the listing gives it, in UTC) into that machine's
+Downloads folder, adding `-2`, `-3`, ... rather than overwrite. With `--copy <dir>` nothing is
+copied there; the file goes into `<dir>` on the Claude Code machine (`cp`, or
+`scp -o BatchMode=yes -o ConnectTimeout=10 <host>:<path> <dir>/<name>`). Not found anywhere: it
+names each place it searched.
+
 ## What the model can and cannot see
 
 - It has one tool, `wispr`, whose description tells it to call it only for a request you made
@@ -194,9 +212,10 @@ new); for a folder, notes created in the window read "New".
   successful login delete the poll cache and each watch's record of what it has seen, so notes from
   one account never reach a session after you sign in as another; armed watches stay armed and
   start from a fresh baseline (no alert for what already exists).
-- **Nothing else is written**: no files, no logs. The only processes the plugin starts are the
-  login listener and, when configured, its ssh forward (see Login), which live at most as long
-  as the sign-in link.
+- **Nothing else is written**: no logs, and no files except the copy a `recording` run makes (see
+  Recordings). The only processes the plugin starts are the login listener and, when configured,
+  its ssh forward (see Login), which live at most as long as the sign-in link, and the short `sh`,
+  `ssh` and `scp` runs of `recording`.
 - Access tokens last 72 hours and are renewed automatically; one login is enough while you keep
   using the plugin. If Wispr later refuses the stored login, you are told once to sign in again.
 
@@ -219,6 +238,7 @@ Nothing is configured by the plugin.
 | network errors only for `api.wisprflow.ai` | your network blocks it: route it through your proxy; `mcp-auth.wisprflow.com` is a different domain and may work already |
 | "login needed" | refresh token refused or expired: run `/wisprflow4agents:login` |
 | a watch is silent | `/wisprflow4agents:watches` shows the last poll and any error; watches follow the session, so check you armed it in this session |
+| `recording` says "No recording" | the app keeps audio only on the machine that recorded it: set `browser_ssh_host` to that laptop and check `ssh -o BatchMode=yes <host> true` |
 | the model says it may not read a folder | the `wispr` tool reads only what this session watches: ask it to watch that folder first, or type `/wisprflow4agents:check <folder>` |
 
 ## Glossary

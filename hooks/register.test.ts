@@ -20,7 +20,7 @@ const FIXTURE = {
 const TOOL = 'mcp__wisprflow4agents__wispr'
 
 /** The mod wired to a fake `$` in its acceptance mode (WISPRFLOW4AGENTS_FAKE: a fixture, never Wispr). */
-async function mod(spawn?: (argv: string[]) => unknown, seed: Record<string, unknown> = {}, shared?: Map<string, unknown>) {
+async function mod(spawn?: (argv: string[]) => unknown, seed: Record<string, unknown> = {}, shared?: Map<string, unknown>, env: Record<string, string> = {}) {
   const hooks: Record<string, any> = {}
   const on = (event: string, a: any, b?: any) => {
     hooks[b ? `${event}:${a.skill ?? a.component}` : event] = b ?? a
@@ -36,7 +36,7 @@ async function mod(spawn?: (argv: string[]) => unknown, seed: Record<string, unk
   const tools: any[] = []
   const timer = { cancel() {} }
   const $ = {
-    env: { get: async (k: string) => ({ WISPRFLOW4AGENTS_FAKE: '/fixture.json', HOME: '/home/x' })[k] },
+    env: { get: async (k: string) => ({ WISPRFLOW4AGENTS_FAKE: '/fixture.json', HOME: '/home/x', ...env })[k] },
     store: { get: async (k: string) => structuredClone(data.get(k)), set: async (k: string, v: unknown) => void (k === 'fake:poll:folders' && fake.refreshes++, data.set(k, structuredClone(v))), delete: async (k: string) => void data.delete(k), keys: async () => [...data.keys()] },
     fs: {
       read: async () => {
@@ -78,7 +78,7 @@ test('the wispr tool is registered with its schema in the prompt; logout is not 
   const m = await mod()
   assert.equal(m.tools[0].name, 'wispr')
   assert.equal(m.tools[0].isDeferred, false)
-  assert.deepEqual(m.tools[0].inputSchema.properties.verb.enum, ['check', 'watch', 'unwatch', 'watches', 'folders'])
+  assert.deepEqual(m.tools[0].inputSchema.properties.verb.enum, ['check', 'watch', 'unwatch', 'watches', 'folders', 'recording'])
   assert.match(m.tools[0].description, /relayed by another Claude session/)
   assert.match(await m.tool('logout'), /^Unknown verb "logout"/)
   assert.ok(m.data.get('fake:tokens'))
@@ -228,4 +228,109 @@ test('a failing watch counts its streak, tells the session once at 3, again on r
   assert.equal(rec().error, undefined)
   assert.deepEqual(Object.keys(rec().seen).sort(), ['meeting:m1', 'meeting:m2'])
   assert.doesNotMatch(await m.tool('watches'), /failing|error/)
+})
+
+// recording: a meeting's audio, found by a spawned script here or over ssh (argv only here;
+// recording.test.ts runs the script itself)
+const ID = '0a1b2c3d-0000-4000-8000-000000000001'
+const OLD = '0a1b2c3d-0000-4000-8000-000000000000'
+const SYNC = [
+  { id: OLD, title: 'Weekly sync', created_at: '2026-11-13T15:00:00Z' },
+  { id: ID, title: 'Weekly  Sync', created_at: '2026-11-20T15:00:00Z' },
+]
+const OGG = `/Users/x/Library/Application Support/Wispr Flow/meetings/${ID}/upload.ogg`
+/** A finished process: what it printed, and its exit code. */
+const proc = (out: string, code = 0, err = '') => {
+  const parts = [...(out ? [{ stream: 'stdout', text: out }] : []), ...(err ? [{ stream: 'stderr', text: err }] : [])]
+  return { next: async () => (parts.length ? { done: false, value: parts.shift() } : { done: true, value: { code } }), return: async () => ({ done: true }) }
+}
+const found = (copy?: string) => `path=${OGG}\nstat=42600000 1795538806\ndur=5220.5\n${copy ? `copy=${copy}\n` : ''}`
+const none = `none=/home/x/Library/Application Support/Wispr Flow/meetings/${ID}\n`
+async function recMod(answer: (argv: string[]) => unknown, hosts = '') {
+  const argvs: string[][] = []
+  const m = await mod((argv) => (argvs.push(argv), answer(argv)), {}, undefined, hosts ? { WISPRFLOW4AGENTS_BROWSER_SSH: hosts } : {})
+  m.fake.fixture.list_folder_meetings.meetings.push(...SYNC)
+  await m.tool('watch', FOLDER)
+  return { m, argvs }
+}
+
+test('recording: found on this machine and copied into its Downloads; the newest of two matching titles', async () => {
+  const { m, argvs } = await recMod(() => proc(found('/Users/x/Downloads/Weekly-Sync-2026-11-20.ogg')), 'laptop-a')
+  const r = await m.tool('recording', 'weekly sync')
+  assert.match(r, /^2 meetings match "weekly sync"; this is the newest \(older: 0a1b2c3d-0000-4000-8000-000000000000\)\. /)
+  assert.ok(r.includes(`Recording of "Weekly  Sync" (meeting ${ID}): ${OGG}, 42.6 MB, modified 2026-11-24T`))
+  assert.match(r, /, 87 min\. Copied to \/Users\/x\/Downloads\/Weekly-Sync-2026-11-20\.ogg\.$/)
+  assert.equal(argvs.length, 1) // found here: no ssh
+  assert.deepEqual([...argvs[0].slice(0, 2), ...argvs[0].slice(3)], ['sh', '-c', 'sh', ID, 'Weekly-Sync-2026-11-20', '']) // '': the Downloads folder
+})
+
+test('recording: found on an ssh host and copied into the Downloads there; a host that failed is passed over', async () => {
+  const { m, argvs } = await recMod(
+    (argv) =>
+      argv[0] === 'sh'
+        ? proc(none)
+        : argv.includes('laptop-a')
+          ? proc('', 255, 'ssh: connect to host laptop-a port 22: Connection timed out\n')
+          : proc(found('/Users/x/Downloads/Weekly-Sync-2026-11-20-2.ogg')),
+    'laptop-a,laptop-b',
+  )
+  const r = await m.tool('recording', ID)
+  assert.match(r, new RegExp(`^Recording of "Weekly  Sync" \\(meeting ${ID}\\): laptop-b:/Users/x/Library/Application Support/.*/upload\\.ogg, 42\\.6 MB`))
+  assert.match(r, /Copied to laptop-b:\/Users\/x\/Downloads\/Weekly-Sync-2026-11-20-2\.ogg\.$/)
+  assert.deepEqual(argvs[2].slice(0, 7), ['ssh', '-n', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'laptop-b'])
+  assert.match(argvs[2][7], /^sh -c '.*' sh '0a1b2c3d-0000-4000-8000-000000000001' 'Weekly-Sync-2026-11-20' ''$/s)
+})
+
+test('recording: not found anywhere names each place searched', async () => {
+  const { m } = await recMod((argv) => (argv[0] === 'sh' ? proc(none) : proc('', 255, 'Permission denied (publickey).\n')), 'laptop-a')
+  const r = await m.tool('recording', ID)
+  assert.match(r, /^No recording of "Weekly  Sync" \(meeting .*\)\. The Wispr Flow app keeps a meeting's audio only on the machine that recorded it\. /)
+  assert.match(r, /Searched: \/home\/x\/Library\/Application Support\/Wispr Flow\/meetings\/0a1b2c3d-[-0-9a-f]+; laptop-a \(Permission denied \(publickey\)\.\)\.$/)
+})
+
+test('recording: the tool refuses a meeting outside the watched scopes with no command run; the typed run finds it', async () => {
+  const argvs: string[][] = []
+  const m = await mod((argv) => (argvs.push(argv), proc(found('/Users/x/Downloads/Elsewhere-2026-11-20.ogg'))))
+  m.fake.fixture.search_meetings = { meetings: [{ id: ID, title: 'Elsewhere', modified_at: '2026-11-20T15:00:00Z' }] } // in no folder
+  assert.match(await m.tool('recording', 'Elsewhere'), /^Refused: this session has no Wispr watch\. Reading is limited/)
+  await m.tool('watch', FOLDER)
+  assert.match(await m.tool('recording', 'Elsewhere'), /^Refused: no meeting "Elsewhere" in a scope this session watches \(\[Team\] Standup\)\. Reading is limited/)
+  assert.equal(argvs.length, 0)
+  assert.match(await m.typed('recording', 'Elsewhere'), /Copied to \/Users\/x\/Downloads\/Elsewhere-2026-11-20\.ogg\./)
+  assert.equal(argvs.length, 1)
+})
+
+test('recording: of the folder membership a watch keeps, only the watched folder counts', async () => {
+  const { m, argvs } = await recMod(() => proc(found('/d/x.ogg')))
+  const item = (title: string, folders: Record<string, string>) => ({ kind: 'meeting', title, when: '2026-11-20T15:00:00Z', folders })
+  const items = { [`meeting:${ID}`]: item('In standup', { f1: FOLDER }), [`meeting:${OLD}`]: item('Other only', { f2: OTHER }) }
+  m.data.set('fake:poll:folders', { at: Date.now(), snapshot: { scope: 'folders', items } }) // the watch's fresh cache: reused, not re-polled
+  assert.match(await m.tool('recording', 'Other only'), /^Refused: no meeting "Other only" in a scope this session watches/)
+  assert.equal(argvs.length, 0)
+  assert.match(await m.tool('recording', 'In standup'), /Copied to \/d\/x\.ogg\./)
+})
+
+test('recording: a meeting id that is not a UUID never reaches a command', async () => {
+  const { m, argvs } = await recMod(() => proc(''))
+  assert.equal(await m.tool('recording', 'Kickoff'), 'Wispr recording failed: meeting id "m1" is not a Wispr meeting id, so nothing was run.')
+  assert.match(await m.tool('recording', "x'; rm -rf ~"), /^Refused: no meeting/)
+  assert.equal(argvs.length, 0)
+})
+
+test('recording --copy: found on a host, scp into a free name in a directory here (relative to the session root)', async () => {
+  const { m, argvs } = await recMod(
+    (argv) =>
+      argv[0] === 'ssh' ? proc(found()) : argv[0] === 'scp' ? proc('') : argv[6] === 'ogg' ? proc('/r/out/Weekly-Sync-2026-11-20-2.ogg\n') : proc(none),
+    'laptop-a',
+  )
+  const r = await m.tool('recording', 'Weekly sync --copy out')
+  assert.match(r, /Copied to \/r\/out\/Weekly-Sync-2026-11-20-2\.ogg\.$/)
+  assert.deepEqual(argvs[0].slice(3), ['sh', ID, 'Weekly-Sync-2026-11-20', '/r/out']) // here: the script itself would cp into the dir
+  assert.match(argvs[1][7], / '-'$/) // on the host: find only, no copy there
+  assert.deepEqual(argvs[2].slice(3), ['sh', '/r/out', 'Weekly-Sync-2026-11-20', 'ogg'])
+  assert.deepEqual(argvs[3], [
+    'scp', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+    `laptop-a:/Users/x/Library/Application?Support/Wispr?Flow/meetings/${ID}/upload.ogg`,
+    '/r/out/Weekly-Sync-2026-11-20-2.ogg',
+  ])
 })
