@@ -1,5 +1,5 @@
 import type { Register } from 'claude-code'
-import { wispr, LoginNeeded } from './wispr.ts'
+import { wispr, singleFlight, LoginNeeded } from './wispr.ts'
 import { band, diff, diffFolder, forget, format, meetingTexts, members, merge, pollAll, pollFolder, pollFolders, prefixed } from './watch.ts'
 import { PORT, addressInUse, browserHosts, callbackFromOutput, findCallback, forwardArgv, forwardError, forwardUp, listenerArgvs, loginText, redactCallback } from './login.ts'
 import type { Route } from './login.ts'
@@ -31,6 +31,8 @@ interface Watch {
   lastPoll?: number
   lastChange?: number
   error?: string
+  errorSince?: number // first failed poll of the current streak
+  failures?: number // consecutive failed polls; a success clears both
   seen?: Record<string, string> | Record<string, Member> // `<kind>:<id>` -> 'all': modified_at; a folder: the member's folders
 }
 interface Cache {
@@ -55,6 +57,8 @@ const LOGIN_MS = 15 * MINUTE // how long a sign-in link and its listener live (W
 const FORWARD_MS = 15_000 // one ssh forward's try, past ConnectTimeout=10 and a slow jump host
 const ROUTE_WAIT_MS = 7000 // the login hook waits this long for the forward: hooks have a 10 s budget
 const PERMIT_MS = 30_000 // a typed run's skill.prompt follows its prompt.submit within ~0.1 s
+const POLL_LEASE_MS = 90_000 // one refresh measured ~11 s (7 calls); room for 429 retries
+const STREAK = 3 // consecutive failed polls before the session is told
 const RULE =
   'Reading is limited to what this session watches: check reads only a scope this session has an armed watch on ' +
   '(no scope given: every watched scope), and a session with no watch reads nothing. ' +
@@ -100,6 +104,8 @@ const human = (ms: number) => {
 }
 const ago = (t: number | undefined, now: number) => (t ? human(Math.max(1000, Math.round((now - t) / 1000) * 1000)) + ' ago' : 'never')
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e))
+const clock = (t: number) => new Date(t).toTimeString().slice(0, 5) // local HH:MM
+const NOTICE = 'Notice from the wisprflow4agents plugin (not typed by the user): '
 
 /** `[name words] [--flag value] [--toast]`; the name defaults to 'all'. */
 function parse(args: string, valued: string[], bare: string[]) {
@@ -161,20 +167,30 @@ export const register: Register = (on, options) => {
     )
 
   // One Wispr poll per scope per `maxAge` on this machine: a session whose watch is due reuses a
-  // poll another session made within its interval. maxAge 0 always polls.
+  // poll another session made within its interval, and a store lease makes sessions due at once
+  // share one refresh. maxAge 0 polls (once the lease is free).
+  const owner = Math.random().toString(36).slice(2) // this instance's lease name
   async function poll(scope: string, name: string, maxAge: number): Promise<Cache> {
     const key = 'poll:' + scope
-    const old: Cache | undefined = await io.store.get(key)
-    if (old && Date.now() - old.at < maxAge) return old
-    const snap =
-      scope === 'all'
-        ? await pollAll(page(scope), old?.snapshot)
-        : scope === 'folders'
-          ? await pollFolders((await client().call('list_folders'))?.folders ?? [], page)
-          : await pollFolder(page(scope), scope, name)
-    const fresh = { at: Date.now(), snapshot: snap }
-    await io.store.set(key, fresh)
-    return fresh
+    const asked = Date.now()
+    const ready = async () => {
+      const old: Cache | undefined = await io.store.get(key)
+      return old && (maxAge ? Date.now() - old.at < maxAge : old.at >= asked) ? old : undefined
+    }
+    const refresh = async () => {
+      const old: Cache | undefined = await io.store.get(key)
+      const snap =
+        scope === 'all'
+          ? await pollAll(page(scope), old?.snapshot)
+          : scope === 'folders'
+            ? await pollFolders((await client().call('list_folders'))?.folders ?? [], page)
+            : await pollFolder(page(scope), scope, name)
+      const fresh = { at: Date.now(), snapshot: snap }
+      await io.store.set(key, fresh)
+      return fresh
+    }
+    const deps = { store: io.store, now: Date.now, sleep: io.sleep }
+    return singleFlight(deps, 'poll_lease:' + scope, owner, POLL_LEASE_MS, ready, refresh, `Wispr poll of ${name}`)
   }
 
   async function resolve(name: string): Promise<{ scope: string; name: string }> {
@@ -227,15 +243,30 @@ export const register: Register = (on, options) => {
       const wake: WatchEvent[] = []
       const quiet: WatchEvent[] = []
       let login = false
+      const notices: string[] = []
+      const tell = (w: Watch, text: string) => (w.toast ? io.toast(text) : notices.push(NOTICE + text + ' Tell the user.'))
       for (const w of ((await io.store.get(key)) ?? []) as Watch[]) {
         if (now - (w.lastPoll ?? 0) < w.every) continue
         try {
           const c = await poll(source(w.scope), w.name, w.every)
           const events = eventsOf(w, c.snapshot)
           ;(w.toast ? quiet : wake).push(...events)
-          updates.set(w.armedAt, { lastPoll: c.at, seen: seenOf(w.scope, c.snapshot), error: undefined, ...(events.length && { lastChange: now }) })
+          updates.set(w.armedAt, {
+            lastPoll: c.at,
+            seen: seenOf(w.scope, c.snapshot),
+            error: undefined,
+            errorSince: undefined,
+            failures: undefined,
+            ...(events.length && { lastChange: now }),
+          })
+          if ((w.failures ?? 0) >= STREAK)
+            tell(w, `the Wispr watch on "${w.name}" works again after ${w.failures} failed polls since ${clock(w.errorSince!)}.`)
         } catch (e) {
-          updates.set(w.armedAt, { lastPoll: now, error: msg(e) })
+          const failures = (w.failures ?? 0) + 1
+          const errorSince = w.errorSince ?? now
+          updates.set(w.armedAt, { lastPoll: now, error: msg(e), errorSince, failures })
+          if (failures === STREAK)
+            tell(w, `the Wispr watch on "${w.name}" has failed ${STREAK} polls in a row since ${clock(errorSince)}: ${msg(e)}`)
           if (w.error) continue // one toast per outage
           io.toast(`Wispr watch "${w.name}": ${msg(e)}`)
           if (e instanceof LoginNeeded && !w.toast) login = true
@@ -249,9 +280,14 @@ export const register: Register = (on, options) => {
       const all = merge([...wake, ...quiet])
       unread += all.length
       if (all.length) io.toast(format(all).toast)
-      const prompt = wake.length
-        ? format(merge(wake)).prompt
-        : login && 'A Wispr Flow watch stopped: login needed. Tell the user; /wisprflow4agents:login makes a new sign-in link.'
+      const prompt = [
+        wake.length
+          ? format(merge(wake)).prompt
+          : login && 'A Wispr Flow watch stopped: login needed. Tell the user; /wisprflow4agents:login makes a new sign-in link.',
+        ...notices,
+      ]
+        .filter(Boolean)
+        .join('\n\n')
       if (prompt) void io.submit(prompt).then(() => wake.length && delivered(), () => {})
     } finally {
       busy = false
@@ -584,7 +620,9 @@ export const register: Register = (on, options) => {
       .map(
         (w) =>
           `${w.name}: every ${human(w.every)}${w.toast ? ', toast only' : ''}; last poll ${ago(w.lastPoll, now)}; ` +
-          `last change ${ago(w.lastChange, now)}${w.error ? `; error: ${w.error}` : ''}`,
+          `last change ${ago(w.lastChange, now)}` +
+          `${w.failures ? `; failing since ${clock(w.errorSince ?? now)}, ${w.failures} poll${w.failures > 1 ? 's' : ''}` : ''}` +
+          `${w.error ? `; error: ${w.error}` : ''}`,
       )
       .join('\n')
   }

@@ -122,8 +122,12 @@ A typed `/wisprflow4agents:check` reads any folder, as before. The tool never ru
 Folder names match case-insensitively. A change shows a toast, and unless the watch has
 `--toast` the session also gets one prompt naming the notes (title, time, folder, short excerpt,
 share link; at most 20, then "and N more"). A quiet poll does nothing. When a watch fails it
-shows the error in `/wisprflow4agents:watches` and toasts once per outage; only "login needed" also sends
-one prompt.
+shows the error in `/wisprflow4agents:watches` ("failing since 21:42, 12 polls") and toasts once per
+outage; "login needed" also sends one prompt at once, and any error sends one after 3 failed polls in a
+row, and one more when the watch works again. A failed poll keeps the watch's baseline, so the first
+poll that succeeds reports what changed during the outage. Wispr's "429 Too Many Requests" and
+"503" answers are retried inside the poll (after their `Retry-After` when given, else 2 s doubling,
+at most 60 s of waiting per request), and requests are sent at least 250 ms apart.
 
 What a watch reports. In Wispr a folder works like a tag: a meeting can be in several.
 
@@ -149,7 +153,7 @@ While the session has a watch, a line above the prompt shows it (none without a 
     Wispr ◉ Team A, all · polled 2m ago · 6 notes · 2 new
 
 "new" counts notes changed since the session last got a notice or a check result. On an error
-the line shows it (`login needed`) in place of the counts.
+the line shows it (`login needed`, or `failing (3 polls): <error>`) in place of the counts.
 
 Example `/wisprflow4agents:check` result:
 
@@ -180,7 +184,8 @@ new); for a folder, notes created in the window read "New".
 - **Watches** live in the session and stop when the session process ends. They are re-armed when
   the session resumes (`claude --resume`, `/resume`), follow it through `/clear`, and are
   forgotten after 7 days without a poll. Sessions on one machine watching the same scope share
-  one poll: a session whose watch is due reuses a poll another session made within its interval.
+  one poll: a session whose watch is due reuses a poll another session made within its interval,
+  and sessions due at the same moment take a lease in the store so one polls and the others wait for it.
   Folder watches share one read of every folder's membership (`list_folders` plus one
   `list_folder_meetings` per folder, more pages past 50 members), however many folders are watched.
 - **State** (login tokens, client registration, watches, poll cache) is in the plugin's Claude

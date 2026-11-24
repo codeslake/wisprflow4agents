@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { wispr, pkceChallenge, LoginNeeded, AUTH, MCP_URL, REDIRECT_URI } from './wispr.ts'
+import { wispr, pkceChallenge, singleFlight, LoginNeeded, AUTH, MCP_URL, REDIRECT_URI } from './wispr.ts'
 import type { Deps, Store, Response } from './wispr.ts'
 
 // In-memory store with JSON round-trips, so sessions sharing it see copies, as on disk.
@@ -315,6 +315,54 @@ test('a refresh that hands back the refused token is retried once, then fails', 
   await store.set('tokens', { access_token: 'a0', refresh_token: 'r0', expires_at: clk.now() + HOUR })
   await assert.rejects(w.accessToken('a0'), /refused token/)
   assert.equal(fetch.calls.length, 2)
+})
+
+test('a 429 is retried in the same call after its Retry-After, a 503 with doubling backoff', async () => {
+  const fails = [res(429, 'Too Many Requests', { 'retry-after': '7' }), res(503, 'busy', {}), res(503, 'busy', {})]
+  const log: any[] = []
+  const s = await loggedIn(mcp((msg) => fails.shift() ?? res(200, { jsonrpc: '2.0', id: msg.id, result: { structuredContent: { ok: 1 } } }), log))
+  const t0 = s.clk.now()
+  assert.deepEqual(await s.w.call('list_folders', {}), { ok: 1 })
+  assert.equal(log.filter((l) => l.method === 'tools/call').length, 4)
+  assert.equal(s.clk.now() - t0, 7000 + 4000 + 8000) // Retry-After, then 2 s doubled per attempt (the 250 ms gap is inside these waits)
+})
+
+test('a 429 gives up once the next wait would pass the 60 s budget, and a Retry-After past it is not cut short', async () => {
+  const s = await loggedIn(mcp(() => res(429, 'Too Many Requests', {})))
+  const t0 = s.clk.now()
+  await assert.rejects(s.w.call('list_folders', {}), /tools\/call: HTTP 429 Too Many Requests/)
+  assert.ok(s.clk.now() - t0 <= 61_000)
+  const s2 = await loggedIn(mcp(() => res(429, 'slow down', { 'retry-after': '120' })))
+  const t1 = s2.clk.now()
+  await assert.rejects(s2.w.call('list_folders', {}), /HTTP 429 slow down/)
+  assert.ok(s2.clk.now() - t1 < 1000)
+})
+
+test('calls of one client are paced 250 ms apart', async () => {
+  const s = await loggedIn(mcp((msg) => res(200, { jsonrpc: '2.0', id: msg.id, result: { structuredContent: {} } })))
+  const t0 = s.clk.now()
+  await s.w.call('list_folders', {})
+  await s.w.call('list_folders', {})
+  await s.w.call('list_folders', {})
+  assert.equal(s.clk.now() - t0, 500) // the fake fetch takes no virtual time, so each later call waits the whole gap
+})
+
+test('singleFlight: two sessions sharing a store run the work once; the other reuses its result', async () => {
+  const store = memStore()
+  const clk = clock()
+  let runs = 0
+  const ready = async () => (await store.get('cache')) as string | undefined
+  const work = async () => {
+    runs++
+    await clk.sleep(5000) // a slow refresh
+    await store.set('cache', 'snap')
+    return 'snap'
+  }
+  const deps = { store, now: clk.now, sleep: clk.sleep }
+  const got = await Promise.all([singleFlight(deps, 'lease', 'A', 90_000, ready, work, 'x'), singleFlight(deps, 'lease', 'B', 90_000, ready, work, 'x')])
+  assert.deepEqual(got, ['snap', 'snap'])
+  assert.equal(runs, 1)
+  assert.equal(await store.get('lease'), undefined)
 })
 
 test('logout deletes tokens and client', async () => {

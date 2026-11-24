@@ -317,4 +317,5 @@ test('the band: nothing without a watch; names, last poll, notes and unread; the
   assert.equal(band(five, 0, now), 'Wispr ◉ A, B, C +2 · not polled yet · 1 notes · 0 new')
   assert.equal(band([w, { name: 'all', error: 'Wispr Flow login needed: run /wisprflow4agents:login' }], 0, now), 'Wispr ◉ Standup, all · login needed')
   assert.equal(band([{ name: 'X', error: 'HTTP 503' }], 0, now), 'Wispr ◉ X · HTTP 503')
+  assert.equal(band([{ name: 'X', error: 'HTTP 429 Too Many Requests', failures: 2 }], 0, now), 'Wispr ◉ X · failing (2 polls): HTTP 429 Too Many Requests')
 })

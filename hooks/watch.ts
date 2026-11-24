@@ -390,20 +390,24 @@ export interface BandWatch {
   name: string
   lastPoll?: number
   error?: string
+  failures?: number // consecutive failed polls
   seen?: Record<string, unknown>
 }
 
 /**
- * The line above the prompt while a session watches: names (three, then +N), then the last error,
- * or the last poll, the notes known and how many changed since the session was last told.
+ * The line above the prompt while a session watches: names (three, then +N), then the last error
+ * (after "failing (N polls)" while a streak runs), or the last poll, the notes known and how many changed since the session was last told.
  * No watch: undefined, no band.
  */
 export function band(watches: BandWatch[], unread: number, now: number): string | undefined {
   if (!watches.length) return undefined
   const more = watches.length > 3 ? ` +${watches.length - 3}` : ''
   const head = `Wispr ◉ ${watches.slice(0, 3).map((w) => oneLine(w.name)).join(', ')}${more}`
-  const err = watches.find((w) => w.error)?.error
-  if (err) return `${head} · ${/login needed/i.test(err) ? 'login needed' : clip(oneLine(err), 60)}`
+  const bad = watches.find((w) => w.error)
+  if (bad) {
+    const err = /login needed/i.test(bad.error!) ? 'login needed' : clip(oneLine(bad.error!), 60)
+    return `${head} · ${bad.failures ? `failing (${bad.failures} polls): ` : ''}${err}`
+  }
   const last = Math.max(0, ...watches.map((w) => w.lastPoll ?? 0))
   const min = Math.floor((now - last) / 60_000)
   const polled = !last ? 'not polled yet' : min < 1 ? 'polled just now' : min < 60 ? `polled ${min}m ago` : `polled ${Math.floor(min / 60)}h ago`

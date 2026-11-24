@@ -17,6 +17,9 @@ const SKEW_MS = 5 * 60_000 // refresh when less than this is left
 const LEASE_MS = 30_000
 const SETTLE_MS = 300 // a lease is ours only if it still names us after this
 const POLL_MS = 500
+const GAP_MS = 250 // between tool calls of one instance, so a burst does not arrive at once
+const BACKOFF_MS = 2000 // first wait after a 429/503 with no Retry-After; doubles
+const RETRY_BUDGET_MS = 60_000 // total wait one call spends on 429/503 before it gives up
 
 /** The shape of `$.http.fetch`'s answer. Header names are lower-cased. */
 export interface Response {
@@ -86,6 +89,57 @@ function rpcAnswer(r: Response, id: number): any {
 }
 
 class Unauthorized extends Error {}
+/** HTTP 429 or 503: retried by call(). `after`: the server's Retry-After, in ms. */
+class Busy extends Error {
+  after?: number
+  constructor(message: string, after?: number) {
+    super(message)
+    this.after = after
+  }
+}
+
+// Retry-After is delta-seconds or an HTTP date.
+function retryAfter(v: string | undefined, now: number): number | undefined {
+  if (!v) return undefined
+  const ms = /^\d+$/.test(v.trim()) ? Number(v) * 1000 : Date.parse(v) - now
+  return Number.isFinite(ms) ? Math.max(0, ms) : undefined
+}
+
+/**
+ * Runs `work` in at most one place per machine: the holder of store key `key` (a lease named
+ * `owner`). Everyone else waits until `ready()` answers (what the holder produced). No
+ * compare-and-set in the store: write the lease, wait, and work only if it still names us.
+ */
+export async function singleFlight<T>(
+  deps: Pick<Deps, 'store' | 'now' | 'sleep'>,
+  key: string,
+  owner: string,
+  leaseMs: number,
+  ready: () => Promise<T | undefined>,
+  work: () => Promise<T>,
+  what: string,
+): Promise<T> {
+  const { store, now, sleep } = deps
+  const deadline = now() + 2 * leaseMs
+  for (;;) {
+    const r = await ready()
+    if (r !== undefined) return r
+    if (now() > deadline) throw new Error(`${what}: timed out waiting for another session`)
+    const lease = await store.get(key)
+    if (!lease || lease.until <= now() || lease.owner === owner) {
+      await store.set(key, { owner, until: now() + leaseMs })
+      await sleep(SETTLE_MS)
+      if ((await store.get(key))?.owner === owner) {
+        try {
+          return (await ready()) ?? (await work()) // the previous holder may have finished meanwhile
+        } finally {
+          if ((await store.get(key))?.owner === owner) await store.delete(key)
+        }
+      }
+    }
+    await sleep(POLL_MS)
+  }
+}
 
 /**
  * The client. Methods:
@@ -199,29 +253,20 @@ export function wispr(deps: Deps) {
     throw new Error(`Wispr token refresh failed: HTTP ${r.status} ${r.text.slice(0, 200)}`)
   }
 
-  // No compare-and-set in the store: write the lease, wait, and refresh only if it still names us.
-  async function fresh(stale?: string): Promise<string> {
-    const deadline = now() + 2 * LEASE_MS
-    for (;;) {
-      const t: Tokens | undefined = await store.get(TOKENS)
-      if (!t) throw new LoginNeeded()
-      if (usable(t, stale)) return t.access_token
-      if (now() > deadline) throw new Error('Wispr token refresh: timed out waiting for another session')
-      const lease = await store.get(LEASE)
-      if (!lease || lease.until <= now() || lease.owner === owner) {
-        await store.set(LEASE, { owner, until: now() + LEASE_MS })
-        await sleep(SETTLE_MS)
-        if ((await store.get(LEASE))?.owner === owner) {
-          try {
-            return await refresh(stale)
-          } finally {
-            if ((await store.get(LEASE))?.owner === owner) await store.delete(LEASE)
-          }
-        }
-      }
-      await sleep(POLL_MS)
-    }
-  }
+  const fresh = (stale?: string) =>
+    singleFlight(
+      deps,
+      LEASE,
+      owner,
+      LEASE_MS,
+      async () => {
+        const t: Tokens | undefined = await store.get(TOKENS)
+        if (!t) throw new LoginNeeded()
+        return usable(t, stale) ? t.access_token : undefined
+      },
+      () => refresh(stale),
+      'Wispr token refresh',
+    )
 
   /** A valid access token. `stale`: a token the server refused, treated as expired. */
   async function accessToken(stale?: string, retried = false): Promise<string> {
@@ -245,6 +290,8 @@ export function wispr(deps: Deps) {
     if (sid) headers['Mcp-Session-Id'] = sid
     const r = await fetch(MCP_URL, { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id, method, params }) })
     if (r.status === 401) throw new Unauthorized()
+    if (r.status === 429 || r.status === 503)
+      throw new Busy(`Wispr MCP ${method}: HTTP ${r.status} ${r.text.slice(0, 200)}`, retryAfter(r.headers['retry-after'], now()))
     if (!r.ok) throw new Error(`Wispr MCP ${method}: HTTP ${r.status} ${r.text.slice(0, 200)}`)
     const answer = id === undefined ? undefined : rpcAnswer(r, id)
     if (id !== undefined && !answer) throw new Error(`Wispr MCP ${method}: no answer to request ${id} (HTTP ${r.status}) ${r.text.slice(0, 200)}`)
@@ -265,7 +312,7 @@ export function wispr(deps: Deps) {
     return result?.structuredContent ?? (text === undefined ? result : JSON.parse(text))
   }
 
-  async function call(tool: string, args: Record<string, unknown> = {}): Promise<any> {
+  async function authorized(tool: string, args: Record<string, unknown>): Promise<any> {
     let token = await accessToken()
     try {
       return await session(token, tool, args)
@@ -277,6 +324,27 @@ export function wispr(deps: Deps) {
       return await session(token, tool, args)
     } catch (e) {
       throw e instanceof Unauthorized ? new LoginNeeded() : e
+    }
+  }
+
+  // Paced (GAP_MS apart), and a 429/503 is retried in the same call: Retry-After when given, else
+  // doubling from BACKOFF_MS, until the next wait would pass RETRY_BUDGET_MS in all.
+  let nextSlot = 0
+  async function call(tool: string, args: Record<string, unknown> = {}): Promise<any> {
+    let waited = 0
+    for (let attempt = 0; ; attempt++) {
+      const gap = nextSlot - now()
+      nextSlot = Math.max(now(), nextSlot) + GAP_MS
+      if (gap > 0) await sleep(gap)
+      try {
+        return await authorized(tool, args)
+      } catch (e) {
+        if (!(e instanceof Busy)) throw e
+        const wait = e.after ?? BACKOFF_MS * 2 ** attempt
+        if (waited + wait > RETRY_BUDGET_MS) throw e
+        waited += wait
+        await sleep(wait)
+      }
     }
   }
 

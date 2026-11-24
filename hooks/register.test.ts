@@ -20,14 +20,16 @@ const FIXTURE = {
 const TOOL = 'mcp__wisprflow4agents__wispr'
 
 /** The mod wired to a fake `$` in its acceptance mode (WISPRFLOW4AGENTS_FAKE: a fixture, never Wispr). */
-async function mod(spawn?: (argv: string[]) => unknown, seed: Record<string, unknown> = {}) {
+async function mod(spawn?: (argv: string[]) => unknown, seed: Record<string, unknown> = {}, shared?: Map<string, unknown>) {
   const hooks: Record<string, any> = {}
   const on = (event: string, a: any, b?: any) => {
     hooks[b ? `${event}:${a.skill ?? a.component}` : event] = b ?? a
     return { catch: () => {} }
   }
   register(on as any, {} as any)
-  const data = new Map<string, unknown>([['fake:tokens', { access_token: 'a', refresh_token: 'r', expires_at: Date.now() + 86_400_000 }], ...Object.entries(seed)])
+  const data = shared ?? new Map<string, unknown>()
+  for (const [k, v] of [['fake:tokens', { access_token: 'a', refresh_token: 'r', expires_at: Date.now() + 86_400_000 }], ...Object.entries(seed)] as const) data.set(k, v)
+  const fake = { fixture: structuredClone(FIXTURE) as any, fail: '', calls: 0, refreshes: 0 } // fail: every Wispr request throws this
   const toasts: string[] = []
   const submits: string[] = []
   const ticks: (() => void)[] = []
@@ -35,9 +37,15 @@ async function mod(spawn?: (argv: string[]) => unknown, seed: Record<string, unk
   const timer = { cancel() {} }
   const $ = {
     env: { get: async (k: string) => ({ WISPRFLOW4AGENTS_FAKE: '/fixture.json', HOME: '/home/x' })[k] },
-    store: { get: async (k: string) => data.get(k), set: async (k: string, v: unknown) => void data.set(k, v), delete: async (k: string) => void data.delete(k), keys: async () => [...data.keys()] },
-    fs: { read: async () => JSON.stringify(FIXTURE) },
-    clock: { sleep: async () => {}, every: (ms: number, fn: () => void) => (ticks.push(fn), timer), after: () => timer },
+    store: { get: async (k: string) => structuredClone(data.get(k)), set: async (k: string, v: unknown) => void (k === 'fake:poll:folders' && fake.refreshes++, data.set(k, structuredClone(v))), delete: async (k: string) => void data.delete(k), keys: async () => [...data.keys()] },
+    fs: {
+      read: async () => {
+        fake.calls++
+        if (fake.fail) throw new Error(fake.fail)
+        return JSON.stringify(fake.fixture)
+      },
+    },
+    clock: { sleep: () => new Promise<void>((r) => setImmediate(r)), every: (ms: number, fn: () => void) => (ticks.push(fn), timer), after: () => timer },
     ui: { toast: (t: string) => void toasts.push(t), invalidate: () => {}, resolve: () => ({ Text: (props: object) => ({ tag: 'Text', props }) }) },
     prompt: { submit: async ({ text }: { text: string }) => void submits.push(text) },
     process: { spawn: ({ argv }: { argv: string[] }) => spawn?.(argv) },
@@ -59,7 +67,7 @@ async function mod(spawn?: (argv: string[]) => unknown, seed: Record<string, unk
     (await hooks['tool.call']($, { tool: TOOL, verb, ...(args !== undefined && { args }) }, async () => ({ result: 'not mine' }))).result as string
   const bandTree = () => hooks['ui.render:AbovePrompt']($, { props: { hasSurvey: false } }, async () => 'engine')
   const turnEnd = () => hooks['turn.complete']($, {}, async () => ({}))
-  return { submit, skill, typed, tool, turnEnd, bandTree, ticks, tools, data, toasts, submits, contexts }
+  return { submit, skill, typed, tool, turnEnd, bandTree, ticks, tools, data, toasts, submits, contexts, fake }
 }
 
 const until = async (ok: () => boolean) => {
@@ -170,4 +178,54 @@ test('the login listener reports its result to the session as a prompt, and toas
   assert.ok(state)
   assert.match(m.submits[0], /^Notice from the wisprflow4agents plugin.*Signed in to Wispr Flow\. Folders: \[Team\] Standup, Other\./)
   assert.ok(m.toasts.includes(`Signed in to Wispr Flow. Folders: ${FOLDER}, ${OTHER}.`))
+})
+
+const watchKey = 'fake:watches:/r:s1'
+const T0 = Date.now() - 60_000 // a minute ago: recent enough not to be pruned
+const kickoff = { 'meeting:m1': { title: 'Kickoff', folders: { f1: FOLDER, f2: OTHER } } }
+
+test('two sessions sharing a store, due at once, make one refresh of the folder cache', async () => {
+  const data = new Map<string, unknown>()
+  const w = (every: number) => ({ name: FOLDER, scope: 'f1', every, toast: false, armedAt: 1, lastPoll: T0, seen: kickoff })
+  const a = await mod(undefined, { [watchKey]: [w(60_000)] }, data)
+  const b = await mod(undefined, { 'fake:watches:/r:s2': [w(60_000)] }, data)
+  b.fake.fixture = a.fake.fixture
+  a.ticks[0]()
+  b.ticks[0]()
+  await until(() => (data.get(watchKey) as any)[0].lastPoll > T0 && (data.get('fake:watches:/r:s2') as any)?.[0].lastPoll > T0)
+  assert.equal(a.fake.refreshes + b.fake.refreshes, 1)
+  assert.equal(a.fake.calls + b.fake.calls, 6) // list_folders + 2 folders, each an initialize and a tools/call
+})
+
+test('a failing watch counts its streak, tells the session once at 3, again on recovery, and the first success delivers what was filed meanwhile', async () => {
+  const m = await mod(undefined, { [watchKey]: [{ name: FOLDER, scope: 'f1', every: 0, toast: false, armedAt: 1, lastPoll: T0, seen: kickoff }] })
+  const rec = () => (m.data.get(watchKey) as any)[0]
+  const tick = async (n: number) => {
+    m.ticks[0]()
+    await until(() => rec().failures === n)
+    await new Promise((r) => setTimeout(r, 5)) // the tick's band redraw and submit
+  }
+  m.fake.fail = 'Wispr MCP tools/call: HTTP 429 Too Many Requests'
+  await tick(1)
+  await tick(2)
+  assert.deepEqual(m.submits, [])
+  m.fake.fixture.list_folder_meetings.meetings.push({ id: 'm2', title: 'Filed late', created_at: NOW }) // filed while polls fail
+  await tick(3)
+  assert.equal(m.submits.length, 1)
+  assert.match(m.submits[0], /^Notice from the wisprflow4agents plugin .*the Wispr watch on "\[Team\] Standup" has failed 3 polls in a row since \d\d:\d\d: Wispr MCP tools\/call: HTTP 429 Too Many Requests/)
+  await tick(4)
+  assert.equal(m.submits.length, 1) // once per streak
+  assert.equal(m.toasts.filter((t) => /HTTP 429/.test(t)).length, 1) // one toast per outage, as before
+  assert.deepEqual(Object.keys(rec().seen), ['meeting:m1']) // the baseline is kept while failing
+  assert.match(await m.tool('watches'), /; failing since \d\d:\d\d, 4 polls; error: Wispr MCP tools\/call: HTTP 429/)
+  assert.match((await m.bandTree()).props.children, /^Wispr ◉ \[Team\] Standup · failing \(4 polls\): Wispr MCP/)
+  m.fake.fail = ''
+  m.ticks[0]()
+  await until(() => m.submits.length === 2)
+  assert.match(m.submits[1], /- Added: Filed late .* to \[Team\] Standup/)
+  assert.match(m.submits[1], /the Wispr watch on "\[Team\] Standup" works again after 4 failed polls since \d\d:\d\d\./)
+  assert.equal(rec().failures, undefined)
+  assert.equal(rec().error, undefined)
+  assert.deepEqual(Object.keys(rec().seen).sort(), ['meeting:m1', 'meeting:m2'])
+  assert.doesNotMatch(await m.tool('watches'), /failing|error/)
 })
