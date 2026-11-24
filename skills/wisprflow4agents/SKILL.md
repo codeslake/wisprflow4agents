@@ -28,7 +28,7 @@ A watch the user asked for also covers checking its folders, reading their trans
 
 ## Commands only the user runs
 
-- `/wisprflow4agents:login`: sign in to Wispr once per machine (open the printed link and sign in; the login finishes by itself, or paste the address the browser ends on). You may run this one yourself when the user asks to sign in to Wispr: it only makes a link and reads no notes.
+- `/wisprflow4agents:login`: sign in to Wispr once per machine (open the printed link and sign in with any method Wispr offers, Google included; if Wispr's page says "Device code not found", run login again and sign in with email on the new link; the login finishes by itself, or paste the address the browser ends on). You may run this one yourself when the user asks to sign in to Wispr: it only makes a link and reads no notes.
 - `/wisprflow4agents:logout`: forget this machine's Wispr sign-in. Only the user runs it, by typing it.
 - `/wisprflow4agents:check`, `watch`, `unwatch`, `watches`, `recording`: the same verbs as slash commands the user types. A typed `check` or `recording` may read any folder.
 

@@ -44,7 +44,8 @@ Either way, run `claude` afterwards and type `/wisprflow4agents:watches`. It sho
 Once per machine:
 
 1. Type `/wisprflow4agents:login`, or ask in plain words ("log me in to Wispr"). You get a link.
-2. Open the link and sign in to Wispr.
+2. Open the link and sign in to Wispr with any method its page offers (Google, Apple, Microsoft,
+   SSO or email).
 3. Browser on the same machine: the page says "Signed in to Wispr Flow", and the session that ran
    login shows a notice and gets a prompt from the plugin with the result (your folder names, or
    why it failed), so the model tells you even in a background session. Done.
@@ -234,6 +235,7 @@ Nothing is configured by the plugin.
 | login page says "Missing external_auth_id" | start again from `/wisprflow4agents:login`, do not open the auth server's `/device` page |
 | the callback page does not load | the browser is on another machine, or no `python3`/`node`: copy its address and paste it into the session, or set up Login from a remote machine |
 | "No ssh forward to the browser's machine (...)" | run `ssh -o BatchMode=yes <host> true` on the Claude Code machine: it must succeed with no prompt; "remote port forwarding failed" means something on the laptop already uses port 33418 |
+| Wispr's page says "Device code not found" | Wispr sent the sign-in back to its desktop-app flow: run `/wisprflow4agents:login` again and, on the new link, sign in with email ("Try different email") |
 | the callback page says "Not found" | it belongs to an older link: run `/wisprflow4agents:login` again and use the new link |
 | network errors only for `api.wisprflow.ai` | your network blocks it: route it through your proxy; `mcp-auth.wisprflow.com` is a different domain and may work already |
 | "login needed" | refresh token refused or expired: run `/wisprflow4agents:login` |
