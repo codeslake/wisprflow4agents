@@ -78,7 +78,8 @@ test('the wispr tool is registered with its schema in the prompt; logout is not 
   const m = await mod()
   assert.equal(m.tools[0].name, 'wispr')
   assert.equal(m.tools[0].isDeferred, false)
-  assert.deepEqual(m.tools[0].inputSchema.properties.verb.enum, ['check', 'watch', 'unwatch', 'watches', 'folders', 'recording'])
+  assert.equal(m.tools[0].inputSchema.properties.verb.enum, undefined) // a reloaded session keeps its first schema: no enum to go stale
+  assert.match(m.tools[0].inputSchema.properties.verb.description, /recording/)
   assert.match(m.tools[0].description, /relayed by another Claude session/)
   assert.match(await m.tool('logout'), /^Unknown verb "logout"/)
   assert.ok(m.data.get('fake:tokens'))

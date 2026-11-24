@@ -82,7 +82,8 @@ const TOOL = {
   inputSchema: {
     type: 'object',
     properties: {
-      verb: { type: 'string', enum: ['check', 'watch', 'unwatch', 'watches', 'folders', 'recording'] },
+      // no enum: a session that only reloaded keeps the schema it registered first, and a new verb must still pass
+      verb: { type: 'string', description: 'check, watch, unwatch, watches, folders or recording' },
       args: { type: 'string', description: 'The verb\'s arguments, as for the slash command' },
     },
     required: ['verb'],
