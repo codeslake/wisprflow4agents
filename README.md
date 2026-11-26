@@ -239,6 +239,7 @@ Nothing is configured by the plugin.
 | the callback page says "Not found" | it belongs to an older link: run `/wisprflow4agents:login` again and use the new link |
 | network errors only for `api.wisprflow.ai` | your network blocks it: route it through your proxy; `mcp-auth.wisprflow.com` is a different domain and may work already |
 | "login needed" | refresh token refused or expired: run `/wisprflow4agents:login` |
+| a meeting is reported hours after it ended | Wispr's cloud gets a meeting, and its folders, only when the Wispr app on the recording machine has finished processing it (that machine asleep, offline or busy delays it); the watch reports it at the next poll after that. `search_meetings` shows the upload time as `modified_at` |
 | a watch is silent | `/wisprflow4agents:watches` shows the last poll and any error; watches follow the session, so check you armed it in this session |
 | `recording` says "No recording" | the app keeps audio only on the machine that recorded it: set `browser_ssh_host` to that laptop and check `ssh -o BatchMode=yes <host> true` |
 | the model says it may not read a folder | the `wispr` tool reads only what this session watches: ask it to watch that folder first, or type `/wisprflow4agents:check <folder>` |

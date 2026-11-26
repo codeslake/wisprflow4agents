@@ -335,3 +335,13 @@ test('recording --copy: found on a host, scp into a free name in a directory her
     '/r/out/Weekly-Sync-2026-11-20-2.ogg',
   ])
 })
+
+test('a watch whose login is gone asks the session, at once, to tell the user and offer a new link', async () => {
+  const m = await mod(undefined, { [watchKey]: [{ name: FOLDER, scope: 'f1', every: 0, toast: false, armedAt: 1, lastPoll: T0, seen: kickoff }] })
+  m.data.delete('fake:tokens') // logged out, or the refresh token was refused
+  m.ticks[0]()
+  await until(() => m.submits.length > 0)
+  assert.equal(m.submits.length, 1)
+  assert.match(m.submits[0], /^A Wispr Flow watch stopped: login needed\. Tell the user; \/wisprflow4agents:login makes a new sign-in link\./)
+  assert.match((await m.bandTree()).props.children, /: login needed$/)
+})
